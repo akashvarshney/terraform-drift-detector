@@ -1,0 +1,1 @@
+"""Observe-only Terraform drift detection."""
