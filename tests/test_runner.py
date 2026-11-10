@@ -1,78 +1,103 @@
 import os
-from pathlib import Path
 import subprocess
-import unittest
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from drift_agent.terraform.runner import TerraformError, TerraformRunner
 
 
-class RunnerTests(unittest.TestCase):
-    def setUp(self):
-        self.runner = TerraformRunner(Path.cwd(), timeout=7)
-
-    @patch("drift_agent.terraform.runner.subprocess.run")
-    def test_fixed_commands_and_noninteractive_execution(self, run):
-        run.return_value = subprocess.CompletedProcess([], 0, stdout="{}")
-        self.runner.init([Path("backend config.hcl")])
-        self.runner.detect_drift(Path("scan.tfplan"), [Path("test vars.tfvars")])
-        self.runner.show(Path("scan.tfplan"))
-        commands = [call.args[0] for call in run.call_args_list]
-        self.assertEqual([command[1] for command in commands], ["init", "plan", "show"])
-        self.assertIn("-backend-config=backend config.hcl", commands[0])
-        self.assertIn("-refresh-only", commands[1])
-        self.assertIn("-detailed-exitcode", commands[1])
-        self.assertIn("-var-file=test vars.tfvars", commands[1])
-        self.assertIn("-lock-timeout=60s", commands[1])
-        self.assertIn("-json", commands[2])
-        for call in run.call_args_list:
-            self.assertFalse(call.kwargs["shell"])
-            self.assertEqual(call.kwargs["timeout"], 7)
-            self.assertEqual(call.kwargs["stderr"], subprocess.DEVNULL)
-        self.assertEqual(run.call_args_list[0].kwargs["stdout"], subprocess.DEVNULL)
-
-    @patch("drift_agent.terraform.runner.subprocess.run")
-    def test_plan_exit_codes(self, run):
-        for exit_code in (0, 2):
-            run.return_value = subprocess.CompletedProcess([], exit_code)
-            self.assertEqual(self.runner.detect_drift(Path("plan"), []), exit_code)
-        for exit_code in (1, 3):
-            run.return_value = subprocess.CompletedProcess([], exit_code, stderr="secret")
-            with self.assertRaises(TerraformError) as caught:
-                self.runner.detect_drift(Path("plan"), [])
-            self.assertEqual(caught.exception.exit_code, exit_code)
-            self.assertNotIn("secret", str(caught.exception))
-
-    @patch("drift_agent.terraform.runner.subprocess.run")
-    def test_timeout_and_missing_binary(self, run):
-        for error, reason in (
-            (subprocess.TimeoutExpired("secret command", 7, output="secret"), "timeout"),
-            (FileNotFoundError("secret path"), "could_not_start"),
-        ):
-            run.side_effect = error
-            with self.assertRaises(TerraformError) as caught:
-                self.runner.init([])
-            self.assertEqual(caught.exception.reason, reason)
-            self.assertNotIn("secret", str(caught.exception))
-
-    def test_environment_cannot_inject_cli_arguments_or_logging(self):
-        with patch.dict(os.environ, {
-            "TF_CLI_ARGS_plan": "-target=some.resource", "TF_LOG": "TRACE",
-            "TF_LOG_PATH": "raw-secrets.log", "TF_DATA_DIR": "shared-data",
-            "ARM_CLIENT_ID": "test-identity", "TF_VAR_region": "test-region",
-        }):
-            runner = TerraformRunner(Path.cwd(), workspace="pilot")
-        self.assertFalse(any(name.startswith(("TF_CLI_ARGS", "TF_LOG")) for name in runner.environment))
-        self.assertEqual(runner.environment["TF_DATA_DIR"], str(Path.cwd() / ".terraform"))
-        self.assertEqual(runner.environment["TF_WORKSPACE"], "pilot")
-        self.assertEqual(runner.environment["ARM_CLIENT_ID"], "test-identity")
-        normalized = {key.upper(): value for key, value in runner.environment.items()}
-        self.assertEqual(normalized["TF_VAR_REGION"], "test-region")
-
-    def test_apply_is_not_allowed(self):
-        with self.assertRaises(ValueError):
-            self.runner._run("apply", [], (0,))
+@pytest.fixture
+def runner(tmp_path: Path) -> TerraformRunner:
+    return TerraformRunner(tmp_path, timeout=7)
 
 
-if __name__ == "__main__":
-    unittest.main()
+@patch("drift_agent.terraform.runner.subprocess.run")
+def test_fixed_commands_and_noninteractive_execution(run, runner: TerraformRunner):
+    run.return_value = subprocess.CompletedProcess([], 0, stdout="{}")
+    runner.init([Path("backend config.hcl")])
+    runner.detect_drift(Path("scan.tfplan"), [Path("test vars.tfvars")])
+    runner.show(Path("scan.tfplan"))
+    runner.fmt(check=True)
+    runner.plan(Path("post.tfplan"), [])
+    runner.validate()
+
+    commands = [call.args[0] for call in run.call_args_list]
+    assert [command[1] for command in commands] == [
+        "init", "plan", "show", "fmt", "plan", "validate",
+    ]
+    assert "-backend-config=backend config.hcl" in commands[0]
+    assert "-refresh-only" in commands[1]
+    assert "-detailed-exitcode" in commands[1]
+    assert "-var-file=test vars.tfvars" in commands[1]
+    assert "-lock-timeout=60s" in commands[1]
+    assert "-json" in commands[2]
+    assert "-check" in commands[3]
+    assert "-refresh-only" not in commands[4]
+    for call in run.call_args_list:
+        assert call.kwargs["shell"] is False
+        assert call.kwargs["timeout"] == 7
+        assert call.kwargs["stderr"] is subprocess.DEVNULL
+        assert call.kwargs["stdin"] is subprocess.DEVNULL
+    assert run.call_args_list[0].kwargs["stdout"] is subprocess.DEVNULL
+    assert run.call_args_list[2].kwargs["stdout"] is subprocess.PIPE
+
+
+@patch("drift_agent.terraform.runner.subprocess.run")
+def test_plan_exit_codes(run, runner: TerraformRunner):
+    for exit_code in (0, 2):
+        run.return_value = subprocess.CompletedProcess([], exit_code)
+        assert runner.detect_drift(Path("plan"), []) == exit_code
+    for exit_code in (1, 3):
+        run.return_value = subprocess.CompletedProcess([], exit_code, stderr="secret")
+        with pytest.raises(TerraformError) as caught:
+            runner.detect_drift(Path("plan"), [])
+        assert caught.value.exit_code == exit_code
+        assert "secret" not in str(caught.value)
+
+
+@patch("drift_agent.terraform.runner.subprocess.run")
+def test_timeout_and_missing_binary(run, runner: TerraformRunner):
+    for error, reason in (
+        (subprocess.TimeoutExpired("secret command", 7, output="secret"), "timeout"),
+        (FileNotFoundError("secret path"), "could_not_start"),
+    ):
+        run.side_effect = error
+        with pytest.raises(TerraformError) as caught:
+            runner.init([])
+        assert caught.value.reason == reason
+        assert "secret" not in str(caught.value)
+
+
+def test_environment_cannot_inject_cli_arguments_or_logging(tmp_path: Path):
+    with patch.dict(
+        os.environ,
+        {
+            "TF_CLI_ARGS_plan": "-target=some.resource",
+            "TF_LOG": "TRACE",
+            "TF_LOG_PATH": "raw-secrets.log",
+            "TF_DATA_DIR": "shared-data",
+            "ARM_CLIENT_ID": "test-identity",
+            "TF_VAR_region": "test-region",
+        },
+    ):
+        runner = TerraformRunner(tmp_path, workspace="pilot")
+    assert not any(name.startswith(("TF_CLI_ARGS", "TF_LOG")) for name in runner.environment)
+    assert runner.environment["TF_DATA_DIR"] == str(tmp_path / ".terraform")
+    assert runner.environment["TF_WORKSPACE"] == "pilot"
+    assert runner.environment["ARM_CLIENT_ID"] == "test-identity"
+    assert runner.environment["TF_VAR_region"] == "test-region"
+    assert runner.environment["TF_IN_AUTOMATION"] == "1"
+    assert runner.environment["TF_INPUT"] == "0"
+
+
+def test_apply_is_not_allowed(runner: TerraformRunner):
+    for stage in ("apply", "destroy", "import", "state"):
+        with pytest.raises(ValueError):
+            runner._run(stage, [], (0,))
+
+
+def test_timeout_must_be_positive(tmp_path: Path):
+    with pytest.raises(ValueError):
+        TerraformRunner(tmp_path, timeout=0)

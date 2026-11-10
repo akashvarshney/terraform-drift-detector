@@ -1,0 +1,31 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.14.1",
+  "planned_values": {"root_module": {}},
+  "resource_drift": [
+    {
+      "address": "module.storage.azurerm_storage_account.this",
+      "mode": "managed",
+      "type": "azurerm_storage_account",
+      "name": "this",
+      "provider_name": "registry.terraform.io/hashicorp/azurerm",
+      "change": {
+        "actions": ["update"],
+        "before": {
+          "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-pilot/providers/Microsoft.Storage/storageAccounts/stpilot",
+          "name": "stpilot",
+          "tags": {"owner": "platform-team", "cost_center": "CC-100"}
+        },
+        "after": {
+          "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-pilot/providers/Microsoft.Storage/storageAccounts/stpilot",
+          "name": "stpilot",
+          "tags": {"owner": "platform-team", "cost_center": "CC-200"}
+        },
+        "after_unknown": {},
+        "before_sensitive": {},
+        "after_sensitive": {}
+      }
+    }
+  ],
+  "output_changes": {}
+}

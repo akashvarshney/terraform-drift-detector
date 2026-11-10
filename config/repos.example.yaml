@@ -1,0 +1,49 @@
+# Example repository registry.
+#
+# Copy to config/repos.yaml and replace every placeholder with values from your
+# own environment. No identifiers here are real. `path` is only needed when the
+# checkout is mounted locally (Container Apps Job, local run); `url` is used for
+# GitHub App pull requests and enables pr/auto mode.
+version: 1
+
+repositories:
+  - id: storage-prod
+    url: https://github.com/example-org/storage-platform.git
+    # Mounted checkout for the worker. Inside the container this is /workspace.
+    path: /workspace
+    default_branch: main
+    terraform_root: environments/prod
+    environment: prod
+    owner_email: platform-storage@example.com
+    teams_target: https://example.webhook.office.com/webhookb2/placeholder
+    azure_subscription_id: "00000000-0000-0000-0000-000000000000"
+    mode: observe
+    schedule: daily
+    var_files:
+      - prod.tfvars
+    backend_configs:
+      - backend.hcl
+    auto_allowlist:
+      - tags-metadata-only
+    protected_paths:
+      - ".github/workflows/**"
+      - backend.tf
+      - providers.tf
+      - "**/*.tfbackend"
+
+  - id: network-dev
+    url: https://github.com/example-org/network-platform.git
+    path: /workspace
+    default_branch: main
+    terraform_root: environments/dev
+    environment: dev
+    owner_email: platform-network@example.com
+    teams_target: https://example.webhook.office.com/webhookb2/placeholder
+    azure_subscription_id: "00000000-0000-0000-0000-000000000000"
+    mode: observe
+    schedule: weekly
+    auto_allowlist: []
+    protected_paths:
+      - ".github/workflows/**"
+      - backend.tf
+      - providers.tf

@@ -1,4 +1,9 @@
-"""Reduce refresh-only plans without retaining attribute or output values."""
+"""Reduce refresh-only plans to metadata without retaining any values.
+
+Emitted per resource: address, resource id (needed for Azure Activity
+correlation), actions, and the *names* of changed top-level attributes. No
+attribute value, output value or nested payload is ever copied forward.
+"""
 
 from typing import Any
 
@@ -27,9 +32,19 @@ def _actions(change: Any) -> list[str]:
     return actions
 
 
-def _changed_attributes(change: dict[str, Any]) -> list[str]:
+def _sensitive_attribute_names(change: dict[str, Any]) -> list[str]:
+    """Per-attribute sensitivity markers, used to flag names without values."""
+    names: list[str] = []
+    for key in ("before_sensitive", "after_sensitive"):
+        marker = change.get(key)
+        if isinstance(marker, dict):
+            names.extend(name for name, flag in marker.items() if _has_unknown(flag))
+    return names
+
+
+def _changed_attributes(change: dict[str, Any]) -> list[dict[str, Any]]:
     if change.get("before_sensitive") is True or change.get("after_sensitive") is True:
-        return ["[sensitive]"]
+        return [{"name": "[sensitive]", "sensitive": True}]
     before = change.get("before")
     after = change.get("after")
     unknown = change.get("after_unknown", {})
@@ -38,18 +53,37 @@ def _changed_attributes(change: dict[str, Any]) -> list[str]:
     if after is not None and not isinstance(after, dict):
         raise InvalidPlan("Invalid resource after value.")
     if unknown is True:
-        return ["[unknown]"]
+        return [{"name": "[unknown]", "sensitive": False}]
     if not isinstance(unknown, dict):
         raise InvalidPlan("Invalid resource unknown values.")
     before = before or {}
     after = after or {}
     missing = object()
-    return sorted(
+    sensitive = {name.casefold() for name in _sensitive_attribute_names(change)}
+    changed = sorted(
         name
         for name in before.keys() | after.keys() | unknown.keys()
         if before.get(name, missing) != after.get(name, missing)
         or _has_unknown(unknown.get(name))
     )
+    return [
+        {"name": name, "sensitive": name.casefold() in sensitive} for name in changed
+    ]
+
+
+def _resource_id(change: dict[str, Any]) -> str | None:
+    """The Azure resource id, needed to correlate Activity Log evidence.
+
+    Only the `id` attribute is read, and only as an identifier: it is metadata,
+    never a plan value used for explanation.
+    """
+    for key in ("before", "after"):
+        candidate = change.get(key)
+        if isinstance(candidate, dict):
+            value = candidate.get("id")
+            if isinstance(value, str) and value.startswith("/"):
+                return value
+    return None
 
 
 def parse_plan(plan: Any) -> dict[str, list[dict[str, Any]]]:
@@ -75,6 +109,7 @@ def parse_plan(plan: Any) -> dict[str, list[dict[str, Any]]]:
             continue
         resources.append({
             "address": resource["address"],
+            "resource_id": _resource_id(change),
             "actions": actions,
             "changed_attributes": _changed_attributes(change),
         })

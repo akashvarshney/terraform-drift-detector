@@ -1,0 +1,127 @@
+# Risk policy: deterministic and authoritative.
+#
+# Rules are evaluated in file order and the first match wins, so keep the
+# destructive and security-sensitive rules above generic ones. The model may
+# escalate a level; it can never relax one of these decisions.
+#
+# Matching:
+#   actions_any / actions_all        Terraform change actions
+#   attributes_any / attributes_all  changed top-level attribute names (glob, case-insensitive)
+#
+# auto_allowed is only permitted on low-risk rules, and AUTO mode additionally
+# requires the repository registry to allowlist the matching rule id.
+version: 1
+
+default:
+  # Unknown drift is never auto-remediated.
+  level: high
+  requires_review: true
+  auto_allowed: false
+  reason: "Unclassified drift defaults to manual review."
+
+rules:
+  - id: resource-replacement
+    category: destructive
+    level: blocked
+    reason: "Replacing a resource destroys and recreates infrastructure."
+    actions_all: [delete, create]
+
+  - id: state-destruction
+    category: destructive
+    level: blocked
+    reason: "Deletion, forget or state surgery is never autonomously remediated."
+    actions_any: [delete, forget]
+
+  - id: identity-rbac
+    category: identity
+    level: high
+    reason: "Identity, RBAC or Key Vault drift needs human review."
+    attributes_any:
+      - "identity*"
+      - "*role_assign*"
+      - "*role_definition*"
+      - "principal_id"
+      - "tenant_id"
+      - "*managed_identity*"
+      - "*service_principal*"
+      - "*client_id*"
+      - "key_vault*"
+      - "*access_polic*"
+
+  - id: encryption
+    category: security
+    level: high
+    reason: "Encryption and key management drift needs human review."
+    attributes_any:
+      - "*encryption*"
+      - "*customer_managed_key*"
+      - "*disk_encryption*"
+      - "*cmk*"
+      - "*tls*"
+      - "*min_tls*"
+      - "https_only"
+
+  - id: network-exposure
+    category: network
+    level: high
+    reason: "Public access, firewall and network reachability drift needs human review."
+    attributes_any:
+      - "*public*access*"
+      - "*public_network*"
+      - "*firewall*"
+      - "*ip_rule*"
+      - "*network_rule*"
+      - "*private_endpoint*"
+      - "*private_link*"
+      - "*private_dns*"
+      - "subnet*"
+      - "*network_acl*"
+      - "*nsg*"
+      - "*allowed_origins*"
+
+  - id: sku-capacity
+    category: availability
+    level: high
+    reason: "SKU, scaling, zone or availability drift needs human review."
+    attributes_any:
+      - "sku*"
+      - "tier"
+      - "*capacity*"
+      - "*replica*"
+      - "*zone*"
+      - "*availability*"
+      - "*autoscale*"
+
+  - id: diagnostics
+    category: observability
+    level: medium
+    reason: "Diagnostic and retention settings are reviewed before change."
+    attributes_any:
+      - "*diagnostic*"
+      - "*log_analytics*"
+      - "*monitor*"
+      - "*retention*"
+
+  - id: tags-metadata-only
+    category: metadata
+    level: low
+    requires_review: false
+    auto_allowed: true
+    reason: "Tag/metadata-only drift with no security effect; eligible for auto when allowlisted."
+    actions_any: [update]
+    attributes_all: ["tags"]
+
+  # Deliberately narrow: anything not listed here falls through to the high-risk
+  # default instead of being treated as a routine input change.
+  - id: module-input
+    category: configuration
+    level: medium
+    reason: "Simple approved module input drift goes to a reviewed pull request."
+    actions_any: [update]
+    attributes_any:
+      - name
+      - location
+      - owner
+      - environment
+      - description
+      - enabled

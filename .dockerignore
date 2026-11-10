@@ -1,8 +1,15 @@
 **
 !Dockerfile
+!README.md
 !pyproject.toml
 !src/
 !src/**
+!config/
+!config/**
+!skills/
+!skills/**
 **/__pycache__/
 **/*.pyc
 **/*.egg-info/
+**/.venv/
+**/reports/

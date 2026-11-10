@@ -7,11 +7,20 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=terraform /bin/terraform /usr/local/bin/terraform
 WORKDIR /app
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir . \
-    && useradd --uid 10001 --create-home worker
+COPY config ./config
+COPY skills ./skills
+RUN pip install --no-cache-dir ".[azure,github]" \
+    && useradd --uid 10001 --create-home worker \
+    && mkdir -p /app/reports/audit /workspace \
+    && chown -R worker:worker /app /workspace
 USER worker
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    DRIFT_REPOS_CONFIG=config/repos.yaml \
+    DRIFT_RISK_POLICY=config/risk-policy.yaml \
+    DRIFT_SKILL_PATH=skills/terraform-drift/SKILL.md \
+    DRIFT_AUDIT_DIR=/app/reports/audit \
+    DRIFT_DRY_RUN=true
 ENTRYPOINT ["drift-agent"]
 CMD ["--help"]

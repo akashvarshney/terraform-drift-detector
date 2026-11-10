@@ -1,166 +1,310 @@
-# Terraform Drift Agent: Phase 1
+# Terraform Drift Agent
 
-Minimal, observe-only detector for a trusted Terraform checkout. Designed to run
-once and exit in an Azure Container Apps Job. No Azure resources are provisioned
-by this project.
+An **observe-first** Terraform drift agent for a large Azure estate. It runs
+Terraform itself in an isolated worker, reduces the plan to metadata, applies a
+deterministic risk policy, asks an existing Azure AI Foundry model to explain the
+drift, and — only for low and medium risk — proposes a validated patch as a
+draft pull request.
 
-## Included
+Terraform detects facts. Policy controls safety. AI reasons about context and
+proposes code. GitHub provides review and audit. **Nothing is ever applied.**
 
-- Copy a supplied checkout to a fresh temporary directory, preserving sibling modules.
-- Run only `terraform init`, `terraform plan -refresh-only -detailed-exitcode`, and
-  `terraform show -json` when changes are found.
-- Emit one JSON report with a scan ID, timestamp, clean/drift/error status,
-  Terraform exit code, resource addresses, actions, changed top-level attribute
-  names, changed output names, and a hash of the plan JSON when available.
-- Remove temporary checkout and plan files after the scan.
+This repository implements phases 0–3 of the design document plus most of phase
+4: registry, policy, audit contracts, detection, Azure Activity correlation,
+Foundry classification, repository-aware remediation, validation, draft PRs,
+notifications and structured observability. See [Not implemented](#not-implemented)
+for the deliberate gaps.
 
-Not included: repository cloning or GitHub App authentication, registry,
-multi-repository scheduling, AI, Azure activity correlation, notifications,
-remediation, durable audit storage, or Azure infrastructure deployment.
-Supply an existing checkout for this first slice of Phase 1.
+---
 
-## Local setup
+## How a scan works
 
-Requires Python 3.12+ and Terraform on PATH. The container pins Terraform 1.14.1;
-choose a version compatible with the pilot repository and its state.
-
-PowerShell:
-
-```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\drift-agent.exe --repo tests/fixtures/clean
+```
+prepare ─ copy checkout to a temp dir (source tree is never touched)
+   │
+   ▼
+init ─── terraform init -input=false [+ backend config]
+   │
+   ▼
+detect ─ terraform plan -refresh-only -detailed-exitcode -out=drift.tfplan
+   │            exit 0 → clean: audit, stop. No model call, no notification.
+   │            exit 2 → drift, continue.
+   ▼
+parse ── terraform show -json → addresses, resource ids, actions, attribute names
+   │      (never values, never outputs' values, never secrets)
+   ▼
+enrich ─ Azure Activity Log for the affected resource ids
+   │      (evidence is only attributed when the resource id matches)
+   ▼
+classify ─ deterministic risk policy; hard rules cannot be relaxed by the model
+   │
+   ▼
+explain ─ Foundry model (JSON output): summary, cause, risk, proposed diff
+   │       the model may escalate risk; it can never lower it
+   ▼
+remediate ─ guarded patch: protected paths, module preservation, scope limits
+   │         high/blocked risk never receives a patch (NEEDS_MANUAL_REVIEW)
+   ▼
+validate ─ terraform fmt -check → validate → fresh plan → compare addresses
+   │        an unrelated or destructive post-change plan discards the patch
+   ▼
+publish ─ branch → single commit → draft PR (only in pr/auto mode, never dry run)
+   │
+   ▼
+notify ── Teams/email with reduced facts only
+   │
+   ▼
+audit ─── one JSON record per scan: scan_id, commit, hashes, risk, outcomes
 ```
 
-Use `py -3.12` instead when Python 3.12 is installed. Smoke fixtures use no cloud
-resources, external providers, credentials, or `apply` commands. The integration
-test skips when Terraform is absent.
+## Operating modes
 
-Scan a real checkout only after configuring its backend, credentials, and inputs:
+| Mode | Behaviour | Notes |
+| --- | --- | --- |
+| `observe` | Detect, classify, explain, audit, notify. No code change. | Default in the registry and the container. |
+| `suggest` | Everything above plus a validated patch, held in the run record only. | Use to evaluate model quality. |
+| `pr` | Validated patch → branch → one commit → **draft** pull request. | Recommended production mode. |
+| `auto` | Only when the matched policy rule sets `auto_allowed: true` **and** the repository allowlists that rule id. | Downgrades to `pr` otherwise; never for high/blocked risk. |
 
-```powershell
-.\.venv\Scripts\drift-agent.exe --repo C:/repos/pilot --terraform-root environments/dev --workspace default --var-file dev.tfvars --backend-config backend.hcl
+`--dry-run` is stronger than any mode: no file is edited, no branch, commit, PR
+or notification is created. The record lists the actions it *would* have taken.
+
+## Safety controls
+
+These are deterministic and enforced in code, not by prompt text:
+
+- **Command allowlist.** Only `init`, `plan`, `show`, `fmt`, `validate` exist.
+  `apply`, `destroy`, `import` and `state` raise `ValueError` before execution.
+- **Environment hardening.** `TF_CLI_ARGS*` and `TF_LOG*` are stripped from the
+  subprocess environment; `TF_DATA_DIR` is isolated; `TF_INPUT=0`,
+  `TF_IN_AUTOMATION=1`; `shell=False`; stdin is closed; stderr is discarded.
+- **Value-free by construction.** The parser emits addresses, resource ids,
+  actions and changed attribute *names*. Whole-object sensitivity degrades to
+  `[sensitive]`; per-attribute sensitivity is flagged, never expanded.
+- **Blocked by policy.** Delete/replace, RBAC/identity, encryption, network
+  exposure, SKU/availability and anything unclassified are high or blocked and
+  receive no patch.
+- **Patch guards.** Protected paths (`.github/workflows/**`, `backend.tf`,
+  `providers.tf`, `*.tfbackend`, lock files, key material) are refused; a
+  standalone `azurerm_*` resource is refused when the repository uses modules;
+  provider/backend edits are refused; patches are limited to 3 files / 60 lines;
+  patches apply all-or-nothing and cannot escape the checkout.
+- **Post-change proof.** A patch survives only if `fmt -check`, `validate` and a
+  fresh `plan` pass and that plan contains no address outside the approved drift
+  set and no destructive action.
+- **Evidence discipline.** Activity Log records are attached with
+  `resource_match=false` unless the returned resource id equals the queried one,
+  and only matched evidence is reported as an actor.
+- **Degrade, never fail silent.** A missing Foundry, Azure, GitHub or Teams
+  configuration is recorded as a reason; the drift finding still reaches the
+  audit record and the report.
+
+## Quick start
+
+Requires Python 3.12+ and Terraform on `PATH`.
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"
+drift-agent validate-config --config config/repos.example.yaml
+drift-agent scan --repo tests/fixtures/clean --dry-run
+drift-agent scan-all --config config/repos.yaml --mode observe --dry-run --max-concurrency 5
 ```
 
-`--terraform-root` is relative to the checkout. Input file paths are relative to
-the Terraform root and must remain inside the checkout. Both file options are
-optional and repeatable. Automatic `.tfvars` loading still works. The default
-workspace is explicitly `default`; use `--workspace` for any other existing
-workspace. The worker never creates a workspace. Initialization starts fresh,
-so backend settings from an existing `.terraform` directory are not reused.
+`--repo` accepts either a registry id or a local checkout path, which is handy
+for a single run without any registry.
 
-The default timeout is 600 seconds per Terraform command, configurable using
-`--timeout`. State locking remains enabled with a 60-second lock wait.
+Reports are a single JSON object on **stdout**; structured JSON logs go to
+**stderr**. That split is deliberate: a Container Apps Job keeps the report and
+streams the logs.
 
-## Reports and exit codes
+### Exit codes
 
-Example report fields (IDs, timestamp, and hash omitted here):
+| Result | Report status | Exit |
+| --- | --- | --- |
+| Terraform plan exit 0 | `clean` | 0 |
+| Terraform plan exit 2 | `drift` | 0 (or 2 with `--fail-on-drift`) |
+| Any init/plan/show/parse/input failure | `error` | 1 |
+
+Drift is a finding, not a job failure: exit 0 keeps the scheduled job green while
+`--fail-on-drift` gives CI the strict behaviour.
+
+## Configuration
+
+### Registry — `config/repos.yaml`
+
+```yaml
+version: 1
+repositories:
+  - id: storage-prod
+    url: https://github.com/example-org/storage-platform.git
+    path: /workspace                 # mounted checkout for the worker
+    default_branch: main
+    terraform_root: environments/prod
+    environment: prod
+    owner_email: platform-storage@example.com
+    teams_target: https://example.webhook.office.com/...
+    azure_subscription_id: "00000000-0000-0000-0000-000000000000"
+    mode: pr
+    schedule: daily
+    var_files: [prod.tfvars]
+    backend_configs: [backend.hcl]
+    auto_allowlist: [tags-metadata-only]
+    protected_paths: [".github/workflows/**", backend.tf, providers.tf]
+```
+
+`terraform_root` and every `var_files` / `backend_configs` entry must resolve
+inside the checkout; absolute paths and `..` are rejected.
+
+### Risk policy — `config/risk-policy.yaml`
+
+Rules are evaluated in file order, first match wins, and each rule must constrain
+`actions_*` and/or `attributes_*` (globs, case-insensitive). `auto_allowed` is
+only legal on low-risk rules, and `auto` mode additionally requires the
+repository's `auto_allowlist` to contain that rule id. Unknown drift falls to the
+`default`, which is high and requires review.
+
+The shipped rules mirror the design document: destructive → blocked;
+identity/RBAC, encryption, network exposure, SKU/availability → high; diagnostics
+→ medium; tag-only → low and auto-eligible; a short allowlist of benign module
+inputs → medium. Everything else is high.
+
+### Environment — `.env.example`
+
+| Group | Variables |
+| --- | --- |
+| Agent | `DRIFT_REPOS_CONFIG`, `DRIFT_RISK_POLICY`, `DRIFT_SKILL_PATH`, `DRIFT_AUDIT_DIR`, `DRIFT_TERRAFORM_TIMEOUT`, `DRIFT_MAX_CONCURRENCY`, `DRIFT_TFLINT_ENABLED`, `DRIFT_DRY_RUN`, `DRIFT_LOG_LEVEL` |
+| Foundry | `FOUNDRY_ENDPOINT`, `FOUNDRY_DEPLOYMENT`, `FOUNDRY_API_VERSION`, `FOUNDRY_API_KEY` (prefer managed identity), `FOUNDRY_TIMEOUT` |
+| Azure | `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_ACTIVITY_LOOKBACK_MINUTES`, `AZURE_ACTIVITY_MAX_RECORDS` |
+| GitHub App | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_API_URL` |
+| Notifications | `TEAMS_WEBHOOK_URL`, `GRAPH_SENDER` |
+
+No secret values are read from the repository. The GitHub private key is a
+**path** to a mounted secret file; Foundry and Graph prefer managed identity.
+
+### Finding model context
+
+`skills/terraform-drift/SKILL.md` is loaded as model context on every drift. Only
+the Terraform root's `*.tf` files (redacted, size-capped) are included — never
+`.tfvars`, state or plan files.
+
+## Report shape
 
 ```json
 {
-  "mode": "observe",
-  "status": "drift",
-  "terraform_exit_code": 2,
+  "scan_id": "…", "correlation_id": "…", "repository": "storage-prod",
+  "commit_sha": "…", "terraform_root": "environments/prod", "mode": "pr",
+  "dry_run": false, "status": "drift", "terraform_exit_code": 2,
   "resources": [{
     "address": "module.storage.azurerm_storage_account.this",
+    "resource_id": "/subscriptions/…/storageAccounts/stpilot",
     "actions": ["update"],
-    "changed_attributes": ["tags"]
+    "changed_attributes": [{"name": "tags", "sensitive": false}],
+    "risk": {"level": "low", "policy_rule": "tags-metadata-only",
+             "requires_review": false, "auto_allowed": true}
   }],
-  "outputs": []
+  "outputs": [],
+  "azure_activity": [{"operation": "…/write", "caller": "…", "resource_match": true}],
+  "risk": {"level": "low", "policy_rule": "tags-metadata-only", "requires_review": false},
+  "remediation": {"status": "pr_created", "patch_hash": "…", "pr_url": "…",
+                  "validation": {"passed": true, "steps": []}},
+  "notification": {"sent": ["teams"], "failed": []},
+  "durations_ms": {"total": 41230}
 }
 ```
 
-| Result | Report status | Process exit code |
-| --- | --- | --- |
-| Terraform plan exit 0 | `clean` | 0 |
-| Terraform plan exit 2 | `drift` | 0 |
-| Initialization, plan, show, parsing, or input failure | `error` | 1 |
+## Permissions
 
-Terraform exit code 2 means a successful scan with changes, not a failed job.
-`--fail-on-drift` changes the process exit code to 2 for local/CI use. Do not use
-that flag in Container Apps Jobs unless drift should be treated as job failure.
+| Area | Runtime permission |
+| --- | --- |
+| Azure reads | `Reader` on the pilot scope (`reader_scope_id`) |
+| Azure Activity Log | Read access to the Activity Log for the same scope |
+| Terraform backend | State/blob read plus only the operations `init`/refresh needs |
+| GitHub | GitHub App: Metadata read, Contents read/write, Pull requests read/write |
+| Foundry | Ability to invoke the existing model deployment (managed identity preferred) |
+| Key Vault | Secrets User, only for the GitHub key and optional webhook |
+| Notifications | Teams webhook or Graph `sendMail` for the configured sender |
 
-Refresh-only compares observed infrastructure with saved state. It does not
-detect every configuration-versus-infrastructure difference, discover unmanaged
-resources, or generate a remediation plan. Output-only changes also produce
-`drift`, with an empty resource list and a populated output list.
+Never start with Contributor. Remediation is code/PR based, so no Azure write
+permission is required.
 
 ## Container
 
-Start Docker Desktop with Linux containers enabled, then:
-
-```powershell
-docker build --tag terraform-drift-agent:phase1 .
-docker run --rm --mount "type=bind,source=$((Resolve-Path tests/fixtures/clean).Path),target=/workspace,readonly" terraform-drift-agent:phase1 --repo /workspace
+```bash
+docker build -t terraform-drift-agent:0.2.0 .
+docker run --rm \
+  --mount "type=bind,source=$PWD/tests/fixtures/clean,target=/workspace,readonly" \
+  terraform-drift-agent:0.2.0 scan --repo /workspace --dry-run
 ```
 
-The image uses Python 3.12, includes Git for Terraform module downloads, runs as
-non-root UID 10001, and contains no repository checkout, state, or credentials.
-Override the Terraform version at build time with
-`--build-arg TERRAFORM_VERSION=<approved-version>` when required.
+Python 3.12 slim, Terraform pinned via `--build-arg TERRAFORM_VERSION=…`, `git`
+and CA certificates installed, runs as UID 10001, no Docker socket, no
+credentials, `DRIFT_DRY_RUN=true` by default.
 
-For a real scan, mount the full checkout read-only and provide provider/backend
-authentication separately. Do not bake credentials, state, or a pilot repository
-into the image. The source mount must be readable by UID 10001.
+## Azure deployment
 
-## Azure Container Apps Jobs target
+`deploy/terraform/` creates **only** what does not exist yet: a user-assigned
+identity, a Reader assignment, an Azure Files environment storage registration
+for the pre-staged checkout, and the Container Apps Job (with Key Vault-backed
+secrets and a Secret volume for the GitHub key). The Foundry endpoint, model
+deployment, Key Vault, environment and image are inputs — the module never
+creates a Foundry resource.
 
-Deployment is a separate step. The minimum configuration is:
+```bash
+cd deploy/terraform
+cp terraform.tfvars.example terraform.tfvars   # fill in, keep untracked
+terraform init
+terraform plan -out job.tfplan
+terraform apply job.tfplan
+```
 
-| Setting | Initial value |
-| --- | --- |
-| Workload profile | Consumption |
-| Image | This image pushed to an approved registry |
-| Trigger | Manual for the pilot; Schedule after verification |
-| CPU / memory | Start with 1 vCPU / 2 GiB; measure pilot usage |
-| Arguments | `--repo /workspace --terraform-root environments/dev` plus required file/workspace options |
-| Parallelism / completion count | 1 / 1 |
-| Replica timeout | 1900 seconds with the default per-command timeout |
-| Retry limit | 0 during initial validation |
-| Checkout | Full trusted checkout staged in a mounted volume; not included here |
-| Identity | Managed identity with narrowly scoped provider/backend access |
-| Logs | Retain the single reduced JSON report per scan |
+Assumptions encoded as variables: subscription, resource group, region,
+environment id, workload profile name, image reference, the existing Foundry
+endpoint and deployment name, the Key Vault id and secret names, the checkout
+storage account/share, reader scope, schedule cron, mode and `dry_run`.
 
-A scheduled job has its own cron scheduler; a Function App is not required.
-Container Apps Jobs cannot use a bind mount from your laptop. Before deploying,
-provide a mounted checkout (for example, a pre-staged Azure Files share) or add a
-reviewed GitHub App checkout step. The image alone does not fetch repositories.
-No subscription, registry, identity, mount, or credentials have been configured.
+The checkout share must be **pre-staged** outside this module (for example an
+Azure Files sync of a trusted checkout). Nothing here clones repositories, and
+the worker never persists refreshed state. The image ships only
+`config/repos.example.yaml`, so the fleet registry must live on that share and is
+pointed at by `repos_config_path` (default `/workspace/fleet/repos.yaml`).
 
-For Azure, use managed identity and provider/backend-supported environment
-configuration. Resource Reader access alone may not satisfy Terraform backend
-blob lease/locking operations. Scope backend permissions independently. Avoid
-Contributor access to managed infrastructure for a read-oriented scan.
+## Tests
 
-## Safety and limitations
+```bash
+python -m pytest        # unit + contract tests
+ruff check src tests    # lint
+```
 
-- No `apply`, destroy, state mutation commands, HCL edits, or pull requests.
-- Never print raw Terraform stdout/stderr, plan values, output values, or resource
-  IDs. Failure reports contain a stage, safe reason, and exit code only. Diagnose
-  detailed errors in a separately authorized local session; do not publish raw
-  plan JSON or provider logs.
-- Report addresses and output/attribute names are metadata, not anonymized data.
-  Keep secrets out of names and `for_each` keys; protect access to report logs.
-- `TF_CLI_ARGS*` and `TF_LOG*` are removed from subprocess environments to avoid
-  hidden targeting flags or sensitive debug logs. `TF_DATA_DIR` is isolated.
-  Provider credentials and Terraform input environment variables remain usable.
-- Run only trusted repositories and providers. Terraform providers and external
-  data sources can execute code even during planning. A command allowlist is not
-  a sandbox for untrusted HCL. Use references within the checkout; absolute local
-  module/state paths are not isolated by copying the checkout.
-- The mounted checkout must be a stable snapshot while copying. Local state, if
-  used, is copied with it; prefer an appropriately secured remote backend for
-  shared environments. The worker does not persist refreshed state.
-- Temporary files can contain secrets. Normal completion removes them, but a
-  forcibly terminated host process may leave files until its container is removed.
-- Live Azure resource drift is not seeded by the test suite. Before relying on
-  the pilot, scan representative repositories with real backend access and
-  confirm a harmless out-of-band change appears in `resource_drift`.
+The suite covers the document's required cases: Terraform exit codes 0/1/2, plan
+JSON parsing, sensitive-value redaction, risk rules, protected-path blocking,
+module-preserving remediation, high risk → `NEEDS_MANUAL_REVIEW`, an unrelated
+post-change plan rejecting the patch, GitHub/notification clients untouched in
+dry runs, and a clean repository causing **zero** Foundry calls. Real-Terraform
+fixtures under `tests/fixtures/` cover clean, output-only drift and a missing
+variable; that test skips when `terraform` is not on `PATH`.
 
-## References
+## Disable and roll back
 
-- [Terraform JSON format](https://developer.hashicorp.com/terraform/internals/json-format)
-- [Terraform plan options](https://developer.hashicorp.com/terraform/cli/commands/plan)
-- [Container Apps Jobs](https://learn.microsoft.com/en-us/azure/container-apps/jobs)
-- [Container Apps billing](https://learn.microsoft.com/en-us/azure/container-apps/billing)
+1. Set `DRIFT_DRY_RUN=true` (container default) — external side effects stop.
+2. Drop the repository `mode` to `observe`, or set `enabled: false`.
+3. Set `schedule_cron = ""` and redeploy to return the job to manual trigger.
+4. To stop everything, delete or disable the Container Apps Job; no Azure state
+   is managed by the agent, so there is nothing to unwind.
+5. Draft PRs are never merged automatically: closing them is a complete rollback
+   of any proposed remediation.
+
+## Not implemented
+
+Deliberately out of scope for this slice, and therefore honest gaps:
+
+- `auto` merge/remediation execution. AUTO only ever opens a draft PR; it never
+  applies or merges.
+- MCP server exposure of the tools (the design defers it until a second consumer
+  exists).
+- Repository cloning / GitHub App checkout inside the worker. The job mounts a
+  pre-staged checkout.
+- Durable multi-run dashboards and per-owner routing beyond the registry fields.
+- Live Azure drift seeding in CI: the suite proves detection mechanics, not a
+  real out-of-band change against a subscription. Run `observe` against a pilot
+  repository before trusting `pr` mode.
