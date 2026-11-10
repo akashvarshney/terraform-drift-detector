@@ -51,6 +51,35 @@ variable "max_concurrency" {
   default     = 5
 }
 
+variable "batch_size" {
+  description = "Repositories scanned per execution. 1-2 keeps a pilot nearly free."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.batch_size > 0
+    error_message = "batch_size must be at least 1."
+  }
+}
+
+variable "container_cpu" {
+  description = "vCPU per execution. 0.5 with 1Gi is the cheapest practical size for Terraform."
+  type        = number
+  default     = 0.5
+}
+
+variable "container_memory" {
+  description = "Memory per execution; Consumption pairs 0.5 vCPU with 1Gi."
+  type        = string
+  default     = "1Gi"
+}
+
+variable "replica_timeout_seconds" {
+  description = "Hard cap per execution so a stuck plan cannot keep billing."
+  type        = number
+  default     = 1800
+}
+
 variable "dry_run" {
   description = "Keep true until the pilot has been reviewed end to end."
   type        = bool
@@ -138,4 +167,29 @@ variable "repos_config_path" {
   description = "Registry YAML path inside the mounted share; the image ships only an example."
   type        = string
   default     = "/workspace/fleet/repos.yaml"
+}
+
+# --- Writable state ---------------------------------------------------------
+variable "state_share_name" {
+  description = "Writable Azure Files share (same account) for the ledger and audit records."
+  type        = string
+  default     = "drift-state"
+}
+
+variable "state_mount_path" {
+  description = "Container path where the writable state share is mounted."
+  type        = string
+  default     = "/state"
+}
+
+variable "fleet_state_path" {
+  description = "Rotation ledger path inside the writable share; it must persist between runs."
+  type        = string
+  default     = "/state/fleet/state.json"
+}
+
+variable "audit_dir" {
+  description = "Audit record directory inside the writable share."
+  type        = string
+  default     = "/state/audit"
 }

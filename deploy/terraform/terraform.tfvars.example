@@ -17,3 +17,12 @@ checkout_share_name              = "pilot-checkout"
 default_mode                     = "observe"
 schedule_cron                    = "0 6 * * *"
 dry_run                          = true
+
+# --- Minimal cost profile (Consumption bills only while an execution runs) --
+# 1-2 repositories per daily run: a few hundred vCPU-seconds a month, inside the
+# 180,000 free vCPU-seconds. Increase batch_size to cover the fleet faster.
+batch_size        = 2
+container_cpu     = 0.5
+container_memory  = "1Gi"
+# Writable share for the rotation ledger and audit records; create it first.
+state_share_name  = "drift-state"

@@ -35,6 +35,18 @@ resource "azurerm_container_app_environment_storage" "checkout" {
   access_mode                  = "ReadOnly"
 }
 
+# Writable share for the two runtime artefacts that must outlive an execution:
+# the rotation ledger and the audit records. The checkout share stays read-only,
+# so the worker can never edit the repositories it inspects.
+resource "azurerm_container_app_environment_storage" "state" {
+  name                         = "state"
+  container_app_environment_id = var.container_app_environment_id
+  account_name                 = var.checkout_storage_account_name
+  share_name                   = var.state_share_name
+  access_key                   = var.checkout_storage_account_key
+  access_mode                  = "ReadWrite"
+}
+
 resource "azurerm_container_app_job" "drift" {
   name                         = var.job_name
   resource_group_name          = var.resource_group_name
@@ -42,7 +54,7 @@ resource "azurerm_container_app_job" "drift" {
   container_app_environment_id = var.container_app_environment_id
   workload_profile_name        = var.workload_profile_name
 
-  replica_timeout_in_seconds = 1900
+  replica_timeout_in_seconds = var.replica_timeout_seconds
   replica_retry_limit        = 0
 
   identity {
@@ -93,12 +105,16 @@ resource "azurerm_container_app_job" "drift" {
     container {
       name   = "drift-agent"
       image  = var.container_image
-      cpu    = 1
-      memory = "2Gi"
+      cpu    = var.container_cpu
+      memory = var.container_memory
 
+      # Rotation mode: one small slice per execution. The ledger on the state
+      # share remembers what was already covered, so a large fleet is covered
+      # over successive cheap runs instead of one expensive sweep.
       args = [
         "scan-all",
         "--mode", var.default_mode,
+        "--limit", tostring(var.batch_size),
         "--max-concurrency", tostring(var.max_concurrency),
       ]
 
@@ -110,6 +126,16 @@ resource "azurerm_container_app_job" "drift" {
       env {
         name  = "DRIFT_REPOS_CONFIG"
         value = var.repos_config_path
+      }
+
+      env {
+        name  = "DRIFT_FLEET_STATE"
+        value = var.fleet_state_path
+      }
+
+      env {
+        name  = "DRIFT_AUDIT_DIR"
+        value = var.audit_dir
       }
 
       env {
@@ -164,6 +190,11 @@ resource "azurerm_container_app_job" "drift" {
       }
 
       volume_mounts {
+        name = "state"
+        path = var.state_mount_path
+      }
+
+      volume_mounts {
         name = "github-key"
         path = "/var/run/secrets/github"
       }
@@ -173,6 +204,12 @@ resource "azurerm_container_app_job" "drift" {
       name         = "checkout"
       storage_type = "AzureFile"
       storage_name = azurerm_container_app_environment_storage.checkout.name
+    }
+
+    volume {
+      name         = "state"
+      storage_type = "AzureFile"
+      storage_name = azurerm_container_app_environment_storage.state.name
     }
 
     volume {

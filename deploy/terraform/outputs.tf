@@ -22,3 +22,8 @@ output "checkout_mount_path" {
   description = "Container path of the mounted checkout share."
   value       = var.checkout_mount_path
 }
+
+output "fleet_state_path" {
+  description = "Rotation ledger path; it must survive between executions."
+  value       = var.fleet_state_path
+}

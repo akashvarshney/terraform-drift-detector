@@ -304,6 +304,43 @@ the worker never persists refreshed state. The image ships only
 `config/repos.example.yaml`, so the fleet registry must live on that share and is
 pointed at by `repos_config_path` (default `/workspace/fleet/repos.yaml`).
 
+### Cost profile
+
+Container Apps **Jobs** on the Consumption plan bill only while an execution
+runs — nothing when the job is idle — and every subscription gets 180,000 free
+vCPU-seconds and 360,000 free GiB-seconds per month. A small rotation therefore
+costs effectively nothing:
+
+- Defaults are one execution at a time (`parallelism = 1`,
+  `replica_retry_limit = 0`, one completed replica per execution), sized at
+  `container_cpu = 0.5` / `container_memory = "1Gi"`, scanning
+  `batch_size = 2` repositories via `scan-all --limit`.
+- Five minutes of work at that size is ~150 vCPU-s and ~300 GiB-s. Two
+  repositories a day for a month is roughly 4,500 vCPU-s — about 2.5% of the
+  free grant, so **no compute charge**. Even 100 repositories a month in batches
+  of 10 stays inside it.
+- `replica_timeout_seconds` (default 1800) caps a stuck `terraform plan`.
+- Keep `workload_profile_name = "Consumption"`; a dedicated workload profile
+  bills continuously and defeats the purpose.
+- The costs that do appear are around the job, not the job: the image registry
+  (ACR Basic is a fixed monthly fee — reuse an existing one), the Azure Files
+  shares (cents per GiB) and Log Analytics ingestion if the environment forwards
+  container logs to a workspace (a batch of 1–2 is kilobytes per run).
+
+### State that must survive an execution
+
+Two things are written at runtime and both must outlive the container:
+
+| Variable | Default | Why it matters |
+| --- | --- | --- |
+| `DRIFT_FLEET_STATE` | `/state/fleet/state.json` | Without it the rotation restarts at the first repository on every run |
+| `DRIFT_AUDIT_DIR` | `/state/audit` | Per-scan evidence, kept per day |
+
+The module mounts the checkout share **read-only** and registers a second,
+writable Azure Files share (`state_share_name`, default `drift-state`) mounted at
+`/state` for exactly these two paths. Create that share before `terraform apply`;
+the worker never gets write access to the checkout it inspects.
+
 ## Tests
 
 ```bash
