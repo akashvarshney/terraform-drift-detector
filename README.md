@@ -109,6 +109,10 @@ pip install -e ".[dev]"
 drift-agent validate-config --config config/repos.example.yaml
 drift-agent scan --repo tests/fixtures/clean --dry-run
 drift-agent scan-all --config config/repos.yaml --mode observe --dry-run --max-concurrency 5
+
+# Fleet rotation: the 10 least-recently-scanned repositories, then the rollup
+drift-agent scan-all --config config/repos.yaml --limit 10 --dry-run
+drift-agent fleet-report --config config/repos.yaml --format markdown
 ```
 
 `--repo` accepts either a registry id or a local checkout path, which is handy
@@ -128,6 +132,37 @@ streams the logs.
 
 Drift is a finding, not a job failure: exit 0 keeps the scheduled job green while
 `--fail-on-drift` gives CI the strict behaviour.
+
+## Fleet rotation
+
+Scanning 100+ repositories in one sweep is slow and mostly wasted attention. The
+agent instead keeps a small ledger — `reports/fleet/state.json`, override with
+`DRIFT_FLEET_STATE` or `--fleet-state` — and scans the next slice on each run:
+
+```bash
+drift-agent scan-all --limit 10              # 10 least-recently-scanned repositories
+drift-agent fleet-report --format markdown   # coverage, drift age, next batch
+```
+
+- Order is **never scanned first, then least recently scanned**, so no repository
+  starves and full coverage arrives after `repositories / limit` runs.
+- A repository scanned within `DRIFT_COOLDOWN_HOURS` (default 20) is skipped, so a
+  second run on the same day continues the rotation instead of repeating it.
+  `--force` ignores the cooldown.
+- The ledger is rewritten after **every** repository, so a job stopped halfway
+  through a slice still advances the rotation. A missing or corrupt ledger starts
+  empty rather than blocking a scan.
+- Drift age is tracked per repository: `drifting_since` is set on the first drift
+  scan and cleared only by a clean scan. An errored scan is not evidence of
+  recovery, so it leaves the streak intact.
+- `fleet-report` rolls coverage up by subscription and owner, lists drifting
+  repositories with their age and PR link, and reports how many runs remain until
+  full coverage (`--batch`, `--stale-days`, `--next`, `--output`).
+- Without `--limit`, `scan-all` keeps its original behaviour: every enabled
+  repository, bounded by `--max-concurrency`.
+
+The ledger is derived bookkeeping, not evidence — deleting it only resets the
+rotation. Per-scan audit records remain the record of what was found.
 
 ## Configuration
 
@@ -173,7 +208,7 @@ inputs → medium. Everything else is high.
 
 | Group | Variables |
 | --- | --- |
-| Agent | `DRIFT_REPOS_CONFIG`, `DRIFT_RISK_POLICY`, `DRIFT_SKILL_PATH`, `DRIFT_AUDIT_DIR`, `DRIFT_TERRAFORM_TIMEOUT`, `DRIFT_MAX_CONCURRENCY`, `DRIFT_TFLINT_ENABLED`, `DRIFT_DRY_RUN`, `DRIFT_LOG_LEVEL` |
+| Agent | `DRIFT_REPOS_CONFIG`, `DRIFT_RISK_POLICY`, `DRIFT_SKILL_PATH`, `DRIFT_AUDIT_DIR`, `DRIFT_FLEET_STATE`, `DRIFT_BATCH_SIZE`, `DRIFT_COOLDOWN_HOURS`, `DRIFT_TERRAFORM_TIMEOUT`, `DRIFT_MAX_CONCURRENCY`, `DRIFT_TFLINT_ENABLED`, `DRIFT_DRY_RUN`, `DRIFT_LOG_LEVEL` |
 | Foundry | `FOUNDRY_ENDPOINT`, `FOUNDRY_DEPLOYMENT`, `FOUNDRY_API_VERSION`, `FOUNDRY_API_KEY` (prefer managed identity), `FOUNDRY_TIMEOUT` |
 | Azure | `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_ACTIVITY_LOOKBACK_MINUTES`, `AZURE_ACTIVITY_MAX_RECORDS` |
 | GitHub App | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_API_URL` |
@@ -304,7 +339,9 @@ Deliberately out of scope for this slice, and therefore honest gaps:
   exists).
 - Repository cloning / GitHub App checkout inside the worker. The job mounts a
   pre-staged checkout.
-- Durable multi-run dashboards and per-owner routing beyond the registry fields.
+- A dashboard or triage UI. `fleet-report` produces the consolidated JSON/Markdown
+  over many runs, but there is no hosted view, no waiver-with-expiry and no
+  assignment workflow beyond the registry's `owner_email`.
 - Live Azure drift seeding in CI: the suite proves detection mechanics, not a
   real out-of-band change against a subscription. Run `observe` against a pilot
   repository before trusting `pr` mode.

@@ -32,6 +32,16 @@ def _int(environ: Mapping[str, str], name: str, default: int) -> int:
         return default
 
 
+def _float(environ: Mapping[str, str], name: str, default: float) -> float:
+    value = environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class FoundrySettings:
     endpoint: str | None = None
@@ -105,6 +115,9 @@ class Settings:
     policy_path: Path = Path("config/risk-policy.yaml")
     skill_path: Path = Path("skills/terraform-drift/SKILL.md")
     audit_dir: Path = Path("reports/audit")
+    fleet_state_path: Path = Path("reports/fleet/state.json")
+    batch_size: int = 10
+    cooldown_hours: float = 20.0
     terraform_timeout: int = 600
     max_concurrency: int = 5
     tflint_enabled: bool = False
@@ -124,6 +137,9 @@ class Settings:
             policy_path=Path(env.get("DRIFT_RISK_POLICY", "config/risk-policy.yaml")),
             skill_path=Path(env.get("DRIFT_SKILL_PATH", "skills/terraform-drift/SKILL.md")),
             audit_dir=Path(env.get("DRIFT_AUDIT_DIR", "reports/audit")),
+            fleet_state_path=Path(env.get("DRIFT_FLEET_STATE", "reports/fleet/state.json")),
+            batch_size=_int(env, "DRIFT_BATCH_SIZE", 10),
+            cooldown_hours=_float(env, "DRIFT_COOLDOWN_HOURS", 20.0),
             terraform_timeout=_int(env, "DRIFT_TERRAFORM_TIMEOUT", 600),
             max_concurrency=_int(env, "DRIFT_MAX_CONCURRENCY", 5),
             tflint_enabled=_flag(env, "DRIFT_TFLINT_ENABLED", False),

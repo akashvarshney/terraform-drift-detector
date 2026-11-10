@@ -11,6 +11,7 @@ from typing import Any
 from drift_agent.ai.foundry_client import DisabledFoundryClient, HttpFoundryClient
 from drift_agent.audit.store import LocalJsonAuditStore, NullAuditStore
 from drift_agent.azure.activity import MonitorActivityProvider, NullActivityProvider
+from drift_agent.fleet import FleetState, build_report, due_repositories, render_markdown
 from drift_agent.github.client import AppGitHubClient, DisabledGitHubClient
 from drift_agent.models import DriftRecord, Mode, ScanStatus
 from drift_agent.notifications import CompositeNotifier
@@ -29,6 +30,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--config", help="Repository registry YAML (default: config/repos.yaml).")
     common.add_argument("--policy", help="Risk policy YAML (default: config/risk-policy.yaml).")
     common.add_argument("--audit-dir", help="Audit output directory (default: reports/audit).")
+    common.add_argument(
+        "--fleet-state",
+        help="Rotation ledger path (default: reports/fleet/state.json).",
+    )
     common.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING or ERROR.")
     common.add_argument(
         "--dry-run",
@@ -57,10 +62,40 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--timeout", type=int, default=None, help="Maximum seconds per Terraform command.")
 
     scan_all = subparsers.add_parser(
-        "scan-all", parents=[common], help="Scan every enabled registry repository."
+        "scan-all",
+        parents=[common],
+        help="Scan every enabled repository, or the next slice of the rotation.",
     )
     scan_all.add_argument("--mode", choices=[mode.value for mode in Mode], default=None)
     scan_all.add_argument("--max-concurrency", type=int, default=None)
+    scan_all.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Rotation mode: scan at most N repositories, least recently scanned first.",
+    )
+    scan_all.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore the cooldown and re-scan repositories that are already current.",
+    )
+
+    fleet_report = subparsers.add_parser(
+        "fleet-report",
+        parents=[common],
+        help="Coverage and drift rollup from the rotation ledger.",
+    )
+    fleet_report.add_argument(
+        "--batch", type=int, default=None, help="Planned repositories per run (default 10)."
+    )
+    fleet_report.add_argument(
+        "--stale-days", type=float, default=7.0, help="Age after which a scan counts as stale."
+    )
+    fleet_report.add_argument(
+        "--next", type=int, default=None, help="Repositories to list as the next batch."
+    )
+    fleet_report.add_argument("--format", choices=("json", "markdown"), default="json")
+    fleet_report.add_argument("--output", help="Also write the report to this file.")
 
     subparsers.add_parser(
         "validate-config",
@@ -79,6 +114,8 @@ def _settings(arguments: argparse.Namespace) -> Settings:
         updates["policy_path"] = Path(arguments.policy)
     if arguments.audit_dir:
         updates["audit_dir"] = Path(arguments.audit_dir)
+    if getattr(arguments, "fleet_state", None):
+        updates["fleet_state_path"] = Path(arguments.fleet_state)
     if arguments.log_level:
         updates["log_level"] = arguments.log_level.upper()
     if arguments.dry_run:
@@ -202,6 +239,100 @@ def _validate_config(arguments: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def _counts(records: Sequence[DriftRecord]) -> dict[str, int]:
+    return {
+        "clean": sum(1 for record in records if record.status is ScanStatus.CLEAN),
+        "drift": sum(1 for record in records if record.status is ScanStatus.DRIFT),
+        "error": sum(1 for record in records if record.status is ScanStatus.ERROR),
+    }
+
+
+def _rotating_scan(
+    settings: Settings,
+    repositories: Sequence[Any],
+    mode: Mode | None,
+    arguments: argparse.Namespace,
+) -> int:
+    """Scan one slice of the fleet and advance the ledger after every repository.
+
+    Sequential on purpose: the rotation must reflect each finished repository even
+    when the job is stopped halfway through its slice.
+    """
+    logger = EventLogger("cli")
+    state = FleetState.load(settings.fleet_state_path)
+    due = due_repositories(
+        state,
+        repositories,
+        cooldown_hours=settings.cooldown_hours,
+        force=getattr(arguments, "force", False),
+    )
+    if not due:
+        print(
+            json.dumps(
+                {
+                    "status": "skipped",
+                    "reason": "no_repository_due",
+                    "repositories": len(repositories),
+                    "cooldown_hours": settings.cooldown_hours,
+                    "scans": [],
+                    "counts": {"clean": 0, "drift": 0, "error": 0},
+                },
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    selected = due[: max(1, arguments.limit)]
+    orchestrator = build_orchestrator(settings)
+    records: list[DriftRecord] = []
+    for repo in selected:
+        record = orchestrator.scan(repo, mode)
+        records.append(record)
+        state.record(record)
+        try:
+            state.save(settings.fleet_state_path)
+        except OSError:
+            logger.warning("fleet_state_not_saved", path=str(settings.fleet_state_path))
+    print(
+        json.dumps(
+            {
+                "scans": [record.model_dump(mode="json") for record in records],
+                "counts": _counts(records),
+                "fleet": {
+                    "batch": len(selected),
+                    "due": len(due),
+                    "deferred": len(due) - len(selected),
+                    "repositories": len(repositories),
+                    "state": str(settings.fleet_state_path),
+                },
+            },
+            separators=(",", ":"),
+            default=str,
+        )
+    )
+    return _exit_code(records, arguments.fail_on_drift)
+
+
+def _fleet_report(arguments: argparse.Namespace, settings: Settings) -> int:
+    registry = _load_registry(settings, required=True)
+    state = FleetState.load(settings.fleet_state_path)
+    report = build_report(
+        state,
+        registry,
+        batch_size=arguments.batch or settings.batch_size,
+        stale_days=arguments.stale_days,
+        next_count=arguments.next,
+    )
+    text = (
+        render_markdown(report)
+        if arguments.format == "markdown"
+        else json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    if arguments.output:
+        Path(arguments.output).expanduser().write_text(text, encoding="utf-8")
+    print(text, end="")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
@@ -211,6 +342,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if arguments.command == "validate-config":
         return _validate_config(arguments)
+
+    if arguments.command == "fleet-report":
+        try:
+            return _fleet_report(arguments, settings)
+        except RegistryError as error:
+            logger.error("configuration_error", reason=str(error))
+            print(json.dumps({"status": "error", "reason": str(error)}))
+            return 1
 
     mode = Mode(arguments.mode) if getattr(arguments, "mode", None) else None
     try:
@@ -224,17 +363,15 @@ def main(argv: list[str] | None = None) -> int:
 
         registry = _load_registry(settings, required=True)
         repositories = registry.enabled() if registry else []
+        if getattr(arguments, "limit", 0) > 0:
+            return _rotating_scan(settings, repositories, mode, arguments)
         orchestrator = build_orchestrator(settings)
         records = orchestrator.scan_all(repositories, mode)
         print(
             json.dumps(
                 {
                     "scans": [record.model_dump(mode="json") for record in records],
-                    "counts": {
-                        "clean": sum(1 for r in records if r.status is ScanStatus.CLEAN),
-                        "drift": sum(1 for r in records if r.status is ScanStatus.DRIFT),
-                        "error": sum(1 for r in records if r.status is ScanStatus.ERROR),
-                    },
+                    "counts": _counts(records),
                 },
                 separators=(",", ":"),
                 default=str,
