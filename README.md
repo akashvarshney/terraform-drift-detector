@@ -15,6 +15,14 @@ Foundry classification, repository-aware remediation, validation, draft PRs,
 notifications and structured observability. See [Not implemented](#not-implemented)
 for the deliberate gaps.
 
+## Documentation
+
+- [docs/azure-architecture.md](docs/azure-architecture.md) — target architecture in an
+  Azure Landing Zone: placement, the three identities (OIDC deploy principal,
+  runtime managed identity, GitHub App), private networking, policy and cost.
+- [docs/azure-setup-guide.md](docs/azure-setup-guide.md) — step-by-step deployment plus
+  the local → Azure end-to-end test and troubleshooting table.
+
 ---
 
 ## How a scan works
@@ -285,6 +293,9 @@ secrets and a Secret volume for the GitHub key). The Foundry endpoint, model
 deployment, Key Vault, environment and image are inputs — the module never
 creates a Foundry resource.
 
+Full walkthrough, including the landing zone prerequisites and identity setup:
+[docs/azure-setup-guide.md](docs/azure-setup-guide.md).
+
 ```bash
 cd deploy/terraform
 cp terraform.tfvars.example terraform.tfvars   # fill in, keep untracked
@@ -292,6 +303,10 @@ terraform init
 terraform plan -out job.tfplan
 terraform apply job.tfplan
 ```
+
+`tenant_id` is required: the job passes it to the Azure SDK, and Activity Log
+correlation stays disabled without it. `container_registry_id` is optional but
+needed for a private ACR, because the job identity must hold `AcrPull`.
 
 Assumptions encoded as variables: subscription, resource group, region,
 environment id, workload profile name, image reference, the existing Foundry

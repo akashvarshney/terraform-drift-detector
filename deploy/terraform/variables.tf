@@ -22,9 +22,20 @@ variable "container_app_environment_id" {
   type        = string
 }
 
+variable "tenant_id" {
+  description = "Entra tenant id passed to the job; Activity Log correlation stays off without it."
+  type        = string
+}
+
 variable "container_image" {
   description = "Fully qualified image reference of this repository's build."
   type        = string
+}
+
+variable "container_registry_id" {
+  description = "Optional ACR id; when set, the job identity receives AcrPull for private pulls."
+  type        = string
+  default     = ""
 }
 
 variable "job_name" {

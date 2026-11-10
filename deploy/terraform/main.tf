@@ -47,6 +47,15 @@ resource "azurerm_container_app_environment_storage" "state" {
   access_mode                  = "ReadWrite"
 }
 
+# Private registries deny anonymous pulls: the job identity needs AcrPull on the
+# registry, otherwise every execution fails before the agent starts.
+resource "azurerm_role_assignment" "acr_pull" {
+  count                = var.container_registry_id == "" ? 0 : 1
+  scope                = var.container_registry_id
+  role_definition_name = "AcrPull"
+  principal_id         = azurerm_user_assigned_identity.job.principal_id
+}
+
 resource "azurerm_container_app_job" "drift" {
   name                         = var.job_name
   resource_group_name          = var.resource_group_name
@@ -136,6 +145,18 @@ resource "azurerm_container_app_job" "drift" {
       env {
         name  = "DRIFT_AUDIT_DIR"
         value = var.audit_dir
+      }
+
+      # DefaultAzureCredential needs the tenant to authenticate and the client id
+      # to select this user-assigned identity when the environment has more than one.
+      env {
+        name  = "AZURE_TENANT_ID"
+        value = var.tenant_id
+      }
+
+      env {
+        name  = "AZURE_CLIENT_ID"
+        value = azurerm_user_assigned_identity.job.client_id
       }
 
       env {
