@@ -1,0 +1,40 @@
+# Local end-to-end sandbox for the Terraform drift agent.
+#
+#   docker compose build
+#   docker compose run --rm agent validate-config
+#   docker compose run --rm agent scan --repo /sandbox --dry-run
+#
+# `local/` is git-ignored and holds the checkout, registry, audit/ledger bind
+# mount and local secrets. Full walkthrough: docs/local-setup-guide.md.
+
+name: terraform-drift-agent
+
+services:
+  agent:
+    build:
+      context: .
+      args:
+        TERRAFORM_VERSION: "1.14.1"
+    image: terraform-drift-agent:0.2.0
+    working_dir: /app
+    # Optional; created in step 3 of the guide. Integration variables live here.
+    env_file:
+      - path: local/.env
+        required: false
+    volumes:
+      # Registry, checkouts and reports live on the host so runs are repeatable.
+      - ./local/repos.yaml:/app/config/repos.yaml:ro
+      - ./local/checkout:/workspace:ro
+      - ./local/sandbox:/sandbox:ro
+      - ./local/reports:/app/reports
+      # Offline fixtures shipped with the repository (not baked into the image).
+      - ./tests/fixtures:/fixtures:ro
+
+  # Terraform only, for creating the throwaway drift in local/sandbox. It reuses
+  # the agent image, so `docker compose build agent` must run first.
+  sandbox:
+    image: terraform-drift-agent:0.2.0
+    entrypoint: ["terraform"]
+    working_dir: /sandbox
+    volumes:
+      - ./local/sandbox:/sandbox

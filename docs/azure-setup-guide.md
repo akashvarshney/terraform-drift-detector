@@ -270,6 +270,8 @@ Keep `batch_size = 2` and `dry_run = true` for the first pass.
 ## 7. Local end-to-end test
 
 Do this before the Azure run — it isolates agent bugs from infrastructure bugs.
+For a Docker-only walkthrough with a throwaway drift sandbox, see
+[local-setup-guide.md](local-setup-guide.md).
 
 ```bash
 python -m venv .venv && . .venv/bin/activate

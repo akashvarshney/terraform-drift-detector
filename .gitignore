@@ -13,3 +13,7 @@ dist/
 .env
 .env.*
 reports/
+
+# Local Docker sandbox (docs/local-setup-guide.md)
+local/
+examples/local-drift/marker.txt

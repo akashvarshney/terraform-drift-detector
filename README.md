@@ -17,6 +17,9 @@ for the deliberate gaps.
 
 ## Documentation
 
+- [docs/local-setup-guide.md](docs/local-setup-guide.md) — run the agent locally with
+  Docker, create real drift in a throwaway sandbox, and add Foundry, Activity
+  correlation and a draft PR one at a time (no Azure deployment required).
 - [docs/azure-architecture.md](docs/azure-architecture.md) — target architecture in an
   Azure Landing Zone: placement, the three identities (OIDC deploy principal,
   runtime managed identity, GitHub App), private networking, policy and cost.
@@ -278,6 +281,15 @@ docker build -t terraform-drift-agent:0.2.0 .
 docker run --rm \
   --mount "type=bind,source=$PWD/tests/fixtures/clean,target=/workspace,readonly" \
   terraform-drift-agent:0.2.0 scan --repo /workspace --dry-run
+```
+
+For a local end-to-end test with real drift, a registry and the rotation ledger,
+use the included Compose sandbox — see
+[docs/local-setup-guide.md](docs/local-setup-guide.md):
+
+```bash
+docker compose build
+docker compose run --rm agent scan --repo /sandbox --dry-run
 ```
 
 Python 3.12 slim, Terraform pinned via `--build-arg TERRAFORM_VERSION=…`, `git`
